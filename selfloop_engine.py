@@ -214,58 +214,171 @@ def collapse_warning(history, window=3):
 
 
 # ======================================================================
-# 크롤러 (네트워크 필요 — 로컬 실행 시 작동)
+# 검색·크롤러 (네트워크 필요 — 로컬 실행 시 작동)
 # ======================================================================
-def crawl_topic(topic: str, max_pages=5):
-    """
-    '이 분야 검색해서 학습' 명령 처리.
-    DuckDuckGo HTML 검색 -> 본문 문장 추출. 네트워크 없으면 예외.
-    """
-    import urllib.request, urllib.parse
+def _clean_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _split_sentences(text: str, min_len=12, max_len=220):
+    """한국어/영어가 섞인 웹문서를 학습용 문장으로 쪼갠다."""
+    text = _clean_text(text)
+    # 문장부호 또는 줄바꿈성 구분자를 넓게 사용
+    raw = re.split(r"(?<=[.!?。！？다요죠함음임됨됨니다])\s+|[\n\r]+|[•·]", text)
+    out = []
+    junk = ("cookie", "javascript", "copyright", "로그인", "회원가입", "개인정보", "구독", "광고")
+    for s in raw:
+        s = _clean_text(s)
+        if not (min_len <= len(s) <= max_len):
+            continue
+        if any(j.lower() in s.lower() for j in junk):
+            continue
+        # 너무 URL/기호 위주인 문장 제거
+        alpha_ko = len(re.findall(r"[A-Za-z가-힣0-9]", s))
+        if alpha_ko / max(1, len(s)) < 0.45:
+            continue
+        out.append(s)
+    return out
+
+
+def _fetch_url_text(url: str, timeout=12) -> str:
+    import urllib.request
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (SelfLoopSOM/1.0; educational crawler)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        ctype = r.headers.get("Content-Type", "")
+    # 간단 디코딩. 한국어 페이지는 utf-8/euc-kr 섞일 수 있음.
+    for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+        try:
+            return raw.decode(enc, "ignore")
+        except Exception:
+            pass
+    return raw.decode("utf-8", "ignore")
+
+
+class _TextExtractorHTML:
+    """html.parser를 함수 내부 import 없이 쓰기 위한 가벼운 본문 추출기."""
+    pass
+
+
+def _html_to_text(html: str) -> str:
     from html.parser import HTMLParser
 
     class TextExtractor(HTMLParser):
         def __init__(self):
             super().__init__()
-            self.skip = False
+            self.skip_depth = 0
             self.parts = []
         def handle_starttag(self, tag, attrs):
-            if tag in ("script", "style"):
-                self.skip = True
+            if tag.lower() in ("script", "style", "noscript", "svg", "canvas", "header", "footer", "nav"):
+                self.skip_depth += 1
         def handle_endtag(self, tag):
-            if tag in ("script", "style"):
-                self.skip = False
+            if tag.lower() in ("script", "style", "noscript", "svg", "canvas", "header", "footer", "nav") and self.skip_depth:
+                self.skip_depth -= 1
         def handle_data(self, data):
-            if not self.skip:
+            if self.skip_depth == 0:
                 t = data.strip()
                 if t:
                     self.parts.append(t)
 
-    q = urllib.parse.quote(topic)
-    url = f"https://html.duckduckgo.com/html/?q={q}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
-    links = re.findall(r'href="(https?://[^"]+)"', html)[:max_pages]
+    ex = TextExtractor()
+    ex.feed(html)
+    return " ".join(ex.parts)
 
-    sentences = []
-    for link in links:
+
+def _duckduckgo_links(query: str, max_results=8):
+    """DuckDuckGo HTML 검색 결과에서 실제 URL을 추출한다."""
+    import urllib.parse
+    html = _fetch_url_text("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query))
+    links = []
+
+    # DDG는 /l/?uddg=<encoded> 형태가 많음
+    for m in re.findall(r'href=["\']([^"\']+)["\']', html):
+        href = m.replace("&amp;", "&")
+        real = None
+        if "uddg=" in href:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            if "uddg" in qs:
+                real = urllib.parse.unquote(qs["uddg"][0])
+        elif href.startswith("http://") or href.startswith("https://"):
+            real = href
+        if not real:
+            continue
+        if any(block in real for block in ["duckduckgo.com", "javascript:", "mailto:"]):
+            continue
+        if real not in links:
+            links.append(real)
+        if len(links) >= max_results:
+            break
+    return links
+
+
+def crawl_urls(urls, max_sentences=300, delay=0.3):
+    """URL 목록을 직접 크롤링해서 문장 리스트와 소스 로그를 반환한다."""
+    sentences, sources = [], []
+    for url in urls:
         try:
-            r = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
-            page = urllib.request.urlopen(r, timeout=10).read().decode("utf-8", "ignore")
-            ex = TextExtractor(); ex.feed(page)
-            text = " ".join(ex.parts)
-            for s in re.split(r'(?<=[.!?。])\s+|\n', text):
-                s = s.strip()
-                if 10 <= len(s) <= 200:
-                    sentences.append(s)
-        except Exception:
+            html = _fetch_url_text(url)
+            text = _html_to_text(html)
+            ss = _split_sentences(text)
+            if ss:
+                sources.append({"url": url, "sentences": len(ss)})
+                sentences.extend(ss)
+            if delay:
+                time.sleep(delay)
+        except Exception as e:
+            sources.append({"url": url, "error": f"{type(e).__name__}: {e}"})
             continue
     # 중복 제거
     seen, out = set(), []
     for s in sentences:
-        if s not in seen:
-            seen.add(s); out.append(s)
-    return out[:300]
+        key = s.lower().strip()
+        if key not in seen:
+            seen.add(key); out.append(s)
+        if len(out) >= max_sentences:
+            break
+    return out, sources
+
+
+def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None, delay=0.3, return_sources=False):
+    """
+    '이 분야 검색해서 학습' 명령 처리.
+
+    - DuckDuckGo HTML 검색으로 URL 수집
+    - 사용자가 직접 넣은 URL도 함께 크롤링
+    - 본문 문장 추출 후 중복 제거
+    - 네트워크가 막힌 환경에서는 예외를 반환
+
+    return_sources=True면 (sentences, sources, links)를 반환한다.
+    """
+    if not topic and not extra_urls:
+        return ([], [], []) if return_sources else []
+
+    urls = []
+    if topic and topic.strip():
+        urls.extend(_duckduckgo_links(topic.strip(), max_results=max_pages))
+    if extra_urls:
+        for u in extra_urls:
+            u = u.strip()
+            if u and (u.startswith("http://") or u.startswith("https://")) and u not in urls:
+                urls.append(u)
+
+    if not urls:
+        return ([], [], []) if return_sources else []
+
+    sentences, sources = crawl_urls(urls[:max_pages], max_sentences=max_sentences, delay=delay)
+    if return_sources:
+        return sentences, sources, urls[:max_pages]
+    return sentences
 
 
 # ======================================================================
