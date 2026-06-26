@@ -317,16 +317,23 @@ def _split_sentences(text: str, min_len=12, max_len=220):
     return out
 
 
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "identity",
+    "Referer": "https://www.google.com/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
 def _fetch_url_text(url: str, timeout=12) -> str:
     import urllib.request
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (SelfLoopSOM/1.0; educational crawler)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
-        },
-    )
+    req = urllib.request.Request(url, headers=_BROWSER_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
         ctype = r.headers.get("Content-Type", "")
@@ -369,30 +376,66 @@ def _html_to_text(html: str) -> str:
     return " ".join(ex.parts)
 
 
-def _duckduckgo_links(query: str, max_results=8):
-    """DuckDuckGo HTML 검색 결과에서 실제 URL을 추출한다."""
+def _extract_links_generic(html: str, max_results: int):
+    """검색결과 HTML에서 외부 URL 추출 (DDG 리다이렉트 디코딩 포함)."""
     import urllib.parse
-    html = _fetch_url_text("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query))
     links = []
-
-    # DDG는 /l/?uddg=<encoded> 형태가 많음
     for m in re.findall(r'href=["\']([^"\']+)["\']', html):
         href = m.replace("&amp;", "&")
         real = None
-        if "uddg=" in href:
+        if "uddg=" in href:  # DuckDuckGo 리다이렉트
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
             if "uddg" in qs:
                 real = urllib.parse.unquote(qs["uddg"][0])
+        elif "/url?q=" in href:  # Google 리다이렉트
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            if "q" in qs:
+                real = qs["q"][0]
         elif href.startswith("http://") or href.startswith("https://"):
             real = href
         if not real:
             continue
-        if any(block in real for block in ["duckduckgo.com", "javascript:", "mailto:"]):
+        if any(b in real for b in ["duckduckgo.com", "bing.com", "google.com",
+                                   "javascript:", "mailto:", "microsoft.com/",
+                                   "go.microsoft.com", "w3.org"]):
             continue
         if real not in links:
             links.append(real)
         if len(links) >= max_results:
             break
+    return links
+
+
+def _search_links(query: str, max_results=8):
+    """
+    여러 검색 엔진을 순서대로 시도. 하나가 막히면 다음으로 폴백.
+    반환: (links, log) — log는 각 엔진 시도 결과(디버그/화면표시용).
+    """
+    import urllib.parse
+    q = urllib.parse.quote(query)
+    engines = [
+        ("DuckDuckGo Lite", f"https://lite.duckduckgo.com/lite/?q={q}"),
+        ("DuckDuckGo HTML", f"https://html.duckduckgo.com/html/?q={q}"),
+        ("Bing", f"https://www.bing.com/search?q={q}&setlang=ko"),
+        ("Mojeek", f"https://www.mojeek.com/search?q={q}"),
+    ]
+    log = []
+    for name, url in engines:
+        try:
+            html = _fetch_url_text(url)
+            links = _extract_links_generic(html, max_results)
+            log.append(f"{name}: {len(links)}개 링크")
+            if links:
+                return links, log
+        except Exception as e:
+            log.append(f"{name}: 실패({type(e).__name__} {e})")
+            continue
+    return [], log
+
+
+def _duckduckgo_links(query: str, max_results=8):
+    """하위호환 래퍼."""
+    links, _ = _search_links(query, max_results)
     return links
 
 
@@ -427,19 +470,21 @@ def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None, del
     """
     '이 분야 검색해서 학습' 명령 처리.
 
-    - DuckDuckGo HTML 검색으로 URL 수집
+    - 여러 검색 엔진(DDG Lite/HTML, Bing, Mojeek)을 폴백하며 URL 수집
     - 사용자가 직접 넣은 URL도 함께 크롤링
     - 본문 문장 추출 후 중복 제거
-    - 네트워크가 막힌 환경에서는 예외를 반환
+    - 검색/크롤링 실패 시 sources에 진단 로그를 담아 반환
 
     return_sources=True면 (sentences, sources, links)를 반환한다.
     """
     if not topic and not extra_urls:
-        return ([], [], []) if return_sources else []
+        return ([], ["입력된 검색어/URL 없음"], []) if return_sources else []
 
     urls = []
+    search_log = []
     if topic and topic.strip():
-        urls.extend(_duckduckgo_links(topic.strip(), max_results=max_pages))
+        found, search_log = _search_links(topic.strip(), max_results=max_pages)
+        urls.extend(found)
     if extra_urls:
         for u in extra_urls:
             u = u.strip()
@@ -447,11 +492,14 @@ def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None, del
                 urls.append(u)
 
     if not urls:
-        return ([], [], []) if return_sources else []
+        diag = ["검색 결과 0건 — 엔진별 시도:"] + search_log
+        diag.append("→ 모든 검색 엔진이 차단되었거나 네트워크가 막혀 있습니다. "
+                    "URL 직접 입력을 사용해 보세요.")
+        return ([], diag, []) if return_sources else []
 
     sentences, sources = crawl_urls(urls[:max_pages], max_sentences=max_sentences, delay=delay)
     if return_sources:
-        return sentences, sources, urls[:max_pages]
+        return sentences, sources + search_log, urls[:max_pages]
     return sentences
 
 
