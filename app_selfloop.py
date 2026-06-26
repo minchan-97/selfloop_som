@@ -153,23 +153,72 @@ with page[0]:
             content = f.getvalue().decode("utf-8", "ignore")
             new_sentences += [s.strip() for s in content.splitlines() if s.strip()]
     else:
-        topic = st.text_input("학습할 분야/검색어",
-                              placeholder="예: 발달장애 학생 읽기 쉬운 자료")
-        npg = st.slider("크롤링 페이지 수", 1, 10, 5)
-        if st.button("🔍 검색해서 수집"):
-            with st.spinner(f"'{topic}' 크롤링 중..."):
+        st.markdown("#### 🔍 검색 크롤링 학습")
+        topic = st.text_input(
+            "학습할 분야/검색어",
+            placeholder="예: 발달장애 학생 재난 안전 쉬운말 / 온양초 교육계획 창체"
+        )
+        ca, cb, cc = st.columns(3)
+        npg = ca.slider("검색 결과 페이지 수", 1, 20, 5)
+        max_sents = cb.slider("최대 수집 문장", 30, 1000, 300, 10)
+        delay = cc.slider("사이트 요청 간격(초)", 0.0, 2.0, 0.3, 0.1)
+
+        with st.expander("고급: 직접 URL 추가 / 수집 정책", expanded=False):
+            direct_urls = st.text_area(
+                "직접 크롤링할 URL(줄바꿈)",
+                placeholder="https://example.com/page1\nhttps://example.com/page2",
+                height=90,
+            )
+            st.caption("공개 웹페이지의 텍스트만 수집합니다. 로그인이 필요한 페이지, 유료/저작권 문서, robots 정책이 민감한 사이트는 피하세요.")
+
+        col_search, col_clear = st.columns([1, 1])
+        if col_search.button("🔍 검색·크롤링해서 수집", type="primary"):
+            urls = [u.strip() for u in direct_urls.splitlines() if u.strip()]
+            with st.spinner(f"'{topic or '직접 URL'}' 검색·크롤링 중..."):
                 try:
-                    new_sentences = crawl_topic(topic, max_pages=npg)
-                    st.session_state._crawled = new_sentences
-                    st.success(f"{len(new_sentences)}문장 수집")
+                    crawled, sources, links = crawl_topic(
+                        topic,
+                        max_pages=int(npg),
+                        max_sentences=int(max_sents),
+                        extra_urls=urls,
+                        delay=float(delay),
+                        return_sources=True,
+                    )
+                    st.session_state._crawled = crawled
+                    st.session_state._crawl_sources = sources
+                    st.session_state._crawl_links = links
+                    st.success(f"{len(crawled)}문장 수집 · 대상 URL {len(links)}개")
                 except Exception as e:
-                    st.markdown(f'<div class="warn">크롤링 실패: {e}<br>'
-                                f'(이 환경은 네트워크 차단. 로컬에서 작동)</div>',
-                                unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="warn">크롤링 실패: {e}<br>'
+                        f'네트워크가 막힌 환경에서는 작동하지 않습니다. 로컬 PC에서 다시 실행하거나 URL을 직접 넣어보세요.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        if col_clear.button("수집 결과 비우기"):
+            st.session_state._crawled = []
+            st.session_state._crawl_sources = []
+            st.session_state._crawl_links = []
+            st.rerun()
+
         new_sentences = st.session_state.get("_crawled", [])
+        sources = st.session_state.get("_crawl_sources", [])
+        links = st.session_state.get("_crawl_links", [])
+        if links:
+            st.caption("검색/크롤링 대상 URL")
+            st.code("\n".join(links[:20]), language=None)
+        if sources:
+            with st.expander("수집 소스 로그", expanded=False):
+                st.json(sources[:30])
         if new_sentences:
             st.caption(f"수집된 문장 미리보기 ({len(new_sentences)}개)")
-            st.code("\n".join(new_sentences[:8]), language=None)
+            st.code("\n".join(new_sentences[:12]), language=None)
+            st.download_button(
+                "⬇ 수집 코퍼스 txt 다운로드",
+                "\n".join(new_sentences).encode("utf-8"),
+                file_name="crawled_corpus.txt",
+                mime="text/plain",
+            )
 
     st.markdown("### 2 · 라운드 옵션")
     c1, c2, c3 = st.columns(3)
