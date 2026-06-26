@@ -79,6 +79,28 @@ with st.sidebar:
                 f'</div>', unsafe_allow_html=True)
 
     st.divider()
+    st.markdown("### 🔌 GPT / LLM API")
+    api_key_input = st.text_input(
+        "API Key",
+        value=os.environ.get("OPENAI_API_KEY", ""),
+        type="password",
+        help="OpenAI 또는 OpenAI 호환 서버의 API Key. 입력값은 세션에서만 사용됩니다."
+    )
+    base_url_input = st.text_input(
+        "Base URL",
+        value=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        help="OpenAI 기본값: https://api.openai.com/v1 / LM Studio 예: http://localhost:1234/v1"
+    )
+    max_tokens_input = st.number_input("max_tokens", min_value=128, max_value=4096, value=700, step=128)
+    system_prompt_input = st.text_area(
+        "System Prompt",
+        value=("너는 학습된 코퍼스 범위 안에서만 답한다. "
+               "맥락에 없는 내용은 추측하지 말고 모른다고 말한다. "
+               "학습된 의미지도와 도메인 정체성을 유지한다."),
+        height=110
+    )
+
+    st.divider()
     stt = st.session_state.state
     st.markdown(f"**코퍼스** `{len(stt.corpus)}` 문장")
     st.markdown(f"**노드** `{stt.gsom.n}`")
@@ -233,9 +255,12 @@ with page[1]:
         st.caption(f"코퍼스 {len(stt.corpus)}문장 · {stt.gsom.n}노드 위에서 답변")
 
         c1, c2, c3 = st.columns(3)
-        model = c1.selectbox("LLM 모델", ["gpt-4o-mini","gpt-4o","gpt-4-turbo"])
+        model_options = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1", "gpt-4-turbo", "직접 입력"]
+        model_pick = c1.selectbox("LLM 모델", model_options)
+        model = c1.text_input("모델 직접 입력", value="gpt-4o-mini") if model_pick == "직접 입력" else model_pick
         temp = c2.slider("temperature", 0.0, 1.0, 0.3, 0.1)
         topk = c3.slider("맥락 문장 수", 3, 20, 10)
+        save_qa = st.checkbox("질문·답변을 코퍼스에 저장(자기성찰 누적)", value=True)
 
         q = st.text_input("질문", placeholder="학습한 내용을 바탕으로 물어보세요")
 
@@ -266,10 +291,23 @@ with page[1]:
                                 f'학습 범위 밖일 수 있음</div>', unsafe_allow_html=True)
 
                 with st.spinner("LLM 호출 중..."):
-                    ans = llm_answer(q, context, model=model,
-                                     temperature=temp)
+                    ans = llm_answer(
+                        q,
+                        context,
+                        model=model,
+                        temperature=temp,
+                        max_tokens=int(max_tokens_input),
+                        api_key=api_key_input.strip() or None,
+                        base_url=base_url_input.strip() or None,
+                        system_prompt=system_prompt_input.strip() or None,
+                    )
                 st.markdown("#### 답변")
                 st.write(ans)
+
+                if save_qa and ans and not ans.startswith("["):
+                    stt.corpus.append(f"질문: {q}")
+                    stt.corpus.append(f"답변: {ans}")
+                    st.info("질문·답변을 코퍼스에 저장했습니다. 다음 학습 라운드에서 의미지도에 반영됩니다.")
 
             with cR:
                 st.markdown("#### 사용된 맥락")
@@ -287,7 +325,5 @@ with page[1]:
                             f'{" ..." if len(path)>10 else ""}</div>',
                             unsafe_allow_html=True)
 
-        # 답변 내용도 코퍼스로 저장(자기성찰 누적)
         st.divider()
-        if st.checkbox("질문·답변을 코퍼스에 저장(자기성찰 누적)"):
-            st.caption("다음 학습 라운드에서 이 Q·A가 지도에 반영됩니다.")
+        st.caption("팁: 답변 저장을 켜면 Q·A가 코퍼스에 누적됩니다. 이후 학습 루프를 다시 돌리면 SOM 지도와 도메인 경계에 반영됩니다.")
