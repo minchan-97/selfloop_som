@@ -187,7 +187,14 @@ with page[0]:
                     st.session_state._crawled = crawled
                     st.session_state._crawl_sources = sources
                     st.session_state._crawl_links = links
-                    st.success(f"{len(crawled)}문장 수집 · 대상 URL {len(links)}개")
+                    if crawled:
+                        st.success(f"{len(crawled)}문장 수집 · 대상 URL {len(links)}개")
+                    else:
+                        diag = "<br>".join(str(s) for s in sources[:8])
+                        st.markdown(
+                            f'<div class="warn">수집된 문장 0건<br>{diag}</div>',
+                            unsafe_allow_html=True,
+                        )
                 except Exception as e:
                     st.markdown(
                         f'<div class="warn">크롤링 실패: {e}<br>'
