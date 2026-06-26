@@ -74,9 +74,16 @@ with st.sidebar:
         st.session_state.emb = EmbeddingProvider(dim=64, tok_emb_path=tmp)
         st.session_state.state.dim = st.session_state.emb.dim
     mode = st.session_state.emb.mode
-    st.markdown(f'<div class="{"ok" if mode=="tok_emb" else "warn"}">임베딩: '
-                f'{"TinyTransformer tok_emb" if mode=="tok_emb" else "해시 폴백(tok_emb 없음)"}'
-                f'</div>', unsafe_allow_html=True)
+    emb_obj = st.session_state.emb
+    if mode == "tok_emb":
+        st.markdown(f'<div class="ok">임베딩: TinyTransformer tok_emb<br>'
+                    f'vocab={emb_obj.vocab_size} · dim={emb_obj.dim}</div>',
+                    unsafe_allow_html=True)
+    else:
+        msg = "해시 폴백(tok_emb 없음)"
+        if getattr(emb_obj, "load_error", None):
+            msg = f"해시 폴백 · 로드 실패: {emb_obj.load_error}"
+        st.markdown(f'<div class="warn">임베딩: {msg}</div>', unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 🔌 GPT / LLM API")
@@ -92,13 +99,6 @@ with st.sidebar:
         help="OpenAI 기본값: https://api.openai.com/v1 / LM Studio 예: http://localhost:1234/v1"
     )
     max_tokens_input = st.number_input("max_tokens", min_value=128, max_value=4096, value=700, step=128)
-    system_prompt_input = st.text_area(
-        "System Prompt",
-        value=("너는 학습된 코퍼스 범위 안에서만 답한다. "
-               "맥락에 없는 내용은 추측하지 말고 모른다고 말한다. "
-               "학습된 의미지도와 도메인 정체성을 유지한다."),
-        height=110
-    )
 
     st.divider()
     stt = st.session_state.state
@@ -348,7 +348,6 @@ with page[1]:
                         max_tokens=int(max_tokens_input),
                         api_key=api_key_input.strip() or None,
                         base_url=base_url_input.strip() or None,
-                        system_prompt=system_prompt_input.strip() or None,
                     )
                 st.markdown("#### 답변")
                 st.write(ans)
