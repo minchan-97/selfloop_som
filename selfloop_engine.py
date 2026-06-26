@@ -271,27 +271,55 @@ def crawl_topic(topic: str, max_pages=5):
 # ======================================================================
 # LLM 브리지 (답변 루프 — API 키 필요)
 # ======================================================================
-def llm_answer(question: str, context_sentences, model="gpt-4o-mini",
-               temperature=0.3, max_tokens=400):
-    """학습된 SOM 코퍼스에서 뽑은 맥락으로 LLM 답변 생성."""
+def llm_answer(
+    question: str,
+    context_sentences,
+    model="gpt-4o-mini",
+    temperature=0.3,
+    max_tokens=400,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    system_prompt: str | None = None,
+):
+    """
+    학습된 SOM 코퍼스에서 뽑은 맥락으로 OpenAI-compatible LLM 답변 생성.
+
+    - api_key가 전달되면 우선 사용하고, 없으면 OPENAI_API_KEY 환경변수를 사용합니다.
+    - base_url을 전달하면 OpenAI 호환 서버(Ollama proxy, vLLM, LM Studio 등)에도 연결할 수 있습니다.
+      예: https://api.openai.com/v1 또는 http://localhost:1234/v1
+    """
     try:
         from openai import OpenAI
     except Exception:
         return "[openai 미설치] pip install openai 후 사용"
-    if not os.environ.get("OPENAI_API_KEY"):
-        return "[OPENAI_API_KEY 미설정]"
-    client = OpenAI()
+
+    key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return "[API KEY 미설정] 사이드바에 API Key를 입력하거나 OPENAI_API_KEY 환경변수를 설정하세요."
+
+    kwargs = {"api_key": key}
+    if base_url:
+        kwargs["base_url"] = base_url.rstrip("/")
+    client = OpenAI(**kwargs)
+
     ctx = "\n".join(f"- {s}" for s in context_sentences[:15])
-    system = ("너는 학습된 코퍼스 범위 안에서만 답한다. "
-              "맥락에 없는 내용은 모른다고 말한다.")
-    user = f"[학습된 맥락]\n{ctx}\n\n[질문]\n{question}"
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        temperature=temperature, max_tokens=max_tokens,
+    system = system_prompt or (
+        "너는 학습된 코퍼스 범위 안에서만 답한다. "
+        "맥락에 없는 내용은 추측하지 말고 모른다고 말한다. "
+        "답변은 사용자가 이해하기 쉽게 하되, 학습된 맥락과 충돌하지 않게 작성한다."
     )
-    return resp.choices[0].message.content
+    user = f"[학습된 맥락]\n{ctx}\n\n[질문]\n{question}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"[LLM 호출 실패] {type(e).__name__}: {e}"
 
 
 # ======================================================================
