@@ -146,12 +146,30 @@ with page[0]:
         c1, c2 = st.columns(2)
         txt = c1.text_area("문장 직접 입력 (줄바꿈으로 구분)", height=160,
                            placeholder="오늘 날씨가 좋아요\n밥을 먹어요\n...")
-        f = c2.file_uploader("또는 .txt 코퍼스 업로드", type=["txt"])
+        files = c2.file_uploader(
+            "또는 파일 업로드 (txt · md · docx · pdf, 여러 개 가능)",
+            type=["txt", "md", "docx", "pdf"],
+            accept_multiple_files=True,
+        )
         if txt.strip():
             new_sentences += [s.strip() for s in txt.splitlines() if s.strip()]
-        if f is not None:
-            content = f.getvalue().decode("utf-8", "ignore")
-            new_sentences += [s.strip() for s in content.splitlines() if s.strip()]
+        if files:
+            from selfloop_engine import extract_corpus_from_file
+            for f in files:
+                tmp = f"/tmp/upload_{f.name}"
+                with open(tmp, "wb") as out:
+                    out.write(f.getbuffer())
+                sents, info = extract_corpus_from_file(tmp, filename=f.name)
+                if sents:
+                    new_sentences += sents
+                    c2.markdown(f'<div class="ok">{f.name}: {info}</div>',
+                                unsafe_allow_html=True)
+                else:
+                    c2.markdown(f'<div class="warn">{f.name}: {info}</div>',
+                                unsafe_allow_html=True)
+            if new_sentences:
+                c2.caption(f"추출 미리보기 ({len(new_sentences)}문장)")
+                c2.code("\n".join(new_sentences[:6]), language=None)
     else:
         st.markdown("#### 🔍 검색 크롤링 학습")
         topic = st.text_input(
