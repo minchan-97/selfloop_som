@@ -317,6 +317,94 @@ def _split_sentences(text: str, min_len=12, max_len=220):
     return out
 
 
+# ======================================================================
+# 로컬 파일(docx / pdf / txt)에서 코퍼스 추출
+# ======================================================================
+def extract_text_from_docx(path: str) -> str:
+    """Word(.docx) 본문 + 표 셀 텍스트를 추출."""
+    try:
+        import docx
+    except Exception:
+        raise RuntimeError("python-docx 미설치: pip install python-docx")
+    d = docx.Document(path)
+    parts = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+    # 표 안의 텍스트도 수집
+    for table in d.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                t = cell.text.strip()
+                if t:
+                    parts.append(t)
+    return "\n".join(parts)
+
+
+def extract_text_from_pdf(path: str) -> str:
+    """PDF 본문 추출. pdfplumber 우선(레이아웃 양호), 실패 시 pypdf."""
+    text = ""
+    try:
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(path) as pdf:
+            for pg in pdf.pages:
+                t = pg.extract_text() or ""
+                if t.strip():
+                    pages.append(t)
+        text = "\n".join(pages)
+    except Exception:
+        text = ""
+    if not text.strip():
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            text = "\n".join((pg.extract_text() or "") for pg in reader.pages)
+        except Exception as e:
+            raise RuntimeError(f"PDF 추출 실패: {e}")
+    return text
+
+
+def extract_corpus_from_file(path: str, filename: str | None = None,
+                             min_len=12, max_len=220):
+    """
+    업로드 파일 경로에서 학습용 문장 리스트를 추출한다.
+    지원: .docx .pdf .txt .md
+    반환: (sentences, info) — info는 진단 문자열
+    """
+    name = (filename or path).lower()
+    try:
+        if name.endswith(".docx"):
+            raw = extract_text_from_docx(path)
+            kind = "docx"
+        elif name.endswith(".pdf"):
+            raw = extract_text_from_pdf(path)
+            kind = "pdf"
+        elif name.endswith((".txt", ".md")):
+            with open(path, "rb") as f:
+                data = f.read()
+            raw = None
+            for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+                try:
+                    raw = data.decode(enc); break
+                except Exception:
+                    continue
+            raw = raw or data.decode("utf-8", "ignore")
+            kind = "txt"
+        elif name.endswith(".doc"):
+            return [], "구버전 .doc는 미지원입니다. .docx로 저장 후 올려주세요."
+        else:
+            return [], f"지원하지 않는 형식: {name.split('.')[-1]}"
+    except Exception as e:
+        return [], f"{kind if 'kind' in dir() else '파일'} 추출 오류: {e}"
+
+    sents = _split_sentences(raw, min_len=min_len, max_len=max_len)
+    # 중복 제거(순서 보존)
+    seen, uniq = set(), []
+    for s in sents:
+        if s not in seen:
+            seen.add(s); uniq.append(s)
+    info = f"{kind} · 원문 {len(raw)}자 → 문장 {len(uniq)}개"
+    return uniq, info
+
+
 _BROWSER_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
