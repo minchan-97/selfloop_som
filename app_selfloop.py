@@ -176,6 +176,17 @@ with page[0]:
             "학습할 분야/검색어",
             placeholder="예: 발달장애 학생 재난 안전 쉬운말 / 온양초 교육계획 창체"
         )
+        cbk1, cbk2 = st.columns([2, 1])
+        brave_key = cbk1.text_input(
+            "Brave Search API Key (권장)",
+            value=os.environ.get("BRAVE_API_KEY", ""),
+            type="password",
+            help="https://api-dashboard.search.brave.com 에서 무료 발급(월 ~1000건). "
+                 "키가 있으면 안정적으로 검색됩니다. 비우면 무료엔진 스크래핑(자주 차단)."
+        )
+        brave_bodies = cbk2.checkbox("본문까지 크롤링", value=True,
+                                     help="켜면 검색된 URL 본문을 직접 수집(알참). "
+                                          "끄면 검색 스니펫만 사용(빠름, API만으로 완결).")
         ca, cb, cc = st.columns(3)
         npg = ca.slider("검색 결과 페이지 수", 1, 20, 5)
         max_sents = cb.slider("최대 수집 문장", 30, 1000, 300, 10)
@@ -201,6 +212,8 @@ with page[0]:
                         extra_urls=urls,
                         delay=float(delay),
                         return_sources=True,
+                        brave_api_key=brave_key.strip() or None,
+                        brave_fetch_bodies=bool(brave_bodies),
                     )
                     st.session_state._crawled = crawled
                     st.session_state._crawl_sources = sources
