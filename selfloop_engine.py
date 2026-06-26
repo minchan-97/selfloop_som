@@ -494,6 +494,95 @@ def _extract_links_generic(html: str, max_results: int):
     return links
 
 
+def brave_search(query: str, api_key: str, count=10, country="kr",
+                 search_lang="ko", freshness=None, timeout=15):
+    """
+    Brave Search API (web/search)로 검색.
+    반환: (results, error) — results는 [{title,url,description,extra}], error는 실패시 str.
+    """
+    import json
+    import urllib.request, urllib.parse
+    if not api_key:
+        return [], "Brave API Key 없음"
+    params = {
+        "q": query[:380],
+        "count": min(int(count), 20),
+        "country": country,
+        "search_lang": search_lang,
+        "extra_snippets": "true",
+    }
+    if freshness:
+        params["freshness"] = freshness  # pd/pw/pm/py
+    url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "X-Subscription-Token": api_key,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as e:
+        code = e.code
+        hint = {401: "API Key가 틀렸거나 누락(401)",
+                422: "쿼리 파라미터 오류(422)",
+                429: "사용량/요율 초과(429) — 잠시 후 재시도"}.get(code, f"HTTP {code}")
+        return [], f"Brave 검색 실패: {hint}"
+    except Exception as e:
+        return [], f"Brave 검색 실패: {type(e).__name__}: {e}"
+
+    out = []
+    for item in (data.get("web", {}).get("results") or []):
+        out.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "description": item.get("description", ""),
+            "extra": item.get("extra_snippets") or [],
+        })
+    return out, None
+
+
+def brave_collect(query: str, api_key: str, max_pages=8, fetch_bodies=True,
+                  max_sentences=300, country="kr", search_lang="ko",
+                  freshness=None, delay=0.3):
+    """
+    Brave로 검색 → URL 수집 → (옵션) 본문 크롤링까지 해서 학습 문장 추출.
+
+    fetch_bodies=True : 검색된 URL을 직접 크롤링(가장 알찬 코퍼스)
+    fetch_bodies=False: 검색 스니펫/extra_snippets만으로 코퍼스 구성(빠름, API만으로 완결)
+
+    반환: (sentences, sources, links)
+    """
+    results, err = brave_search(query, api_key, count=max_pages,
+                                country=country, search_lang=search_lang,
+                                freshness=freshness)
+    if err:
+        return [], [err], []
+    if not results:
+        return [], ["Brave 검색 결과 0건"], []
+
+    links = [r["url"] for r in results if r["url"]]
+
+    if not fetch_bodies:
+        # 스니펫만으로 코퍼스 구성
+        sents = []
+        for r in results:
+            for chunk in [r["description"]] + list(r["extra"]):
+                sents.extend(_split_sentences(chunk or ""))
+        seen, uniq = set(), []
+        for s in sents:
+            if s not in seen:
+                seen.add(s); uniq.append(s)
+        src = [f"Brave 스니펫 {len(results)}건 → 문장 {len(uniq)}개"]
+        return uniq[:max_sentences], src, links
+
+    # 본문 크롤링 (검색은 Brave가, 본문은 기존 크롤러가)
+    sentences, sources = crawl_urls(links[:max_pages],
+                                    max_sentences=max_sentences, delay=delay)
+    sources = [f"Brave 검색 {len(links)}개 URL"] + sources
+    return sentences, sources, links[:max_pages]
+
+
 def _search_links(query: str, max_results=8):
     """
     여러 검색 엔진을 순서대로 시도. 하나가 막히면 다음으로 폴백.
@@ -554,20 +643,43 @@ def crawl_urls(urls, max_sentences=300, delay=0.3):
     return out, sources
 
 
-def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None, delay=0.3, return_sources=False):
+def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None,
+                delay=0.3, return_sources=False,
+                brave_api_key=None, brave_fetch_bodies=True,
+                country="kr", search_lang="ko", freshness=None):
     """
     '이 분야 검색해서 학습' 명령 처리.
 
-    - 여러 검색 엔진(DDG Lite/HTML, Bing, Mojeek)을 폴백하며 URL 수집
-    - 사용자가 직접 넣은 URL도 함께 크롤링
-    - 본문 문장 추출 후 중복 제거
-    - 검색/크롤링 실패 시 sources에 진단 로그를 담아 반환
+    검색 경로 우선순위:
+      1) Brave API 키가 있으면 Brave Search 사용 (안정적, 권장)
+      2) 키 없으면 무료 검색엔진 스크래핑 폴백 (DDG/Bing/Mojeek — 자주 차단됨)
+    사용자가 직접 넣은 URL(extra_urls)은 항상 함께 크롤링.
 
     return_sources=True면 (sentences, sources, links)를 반환한다.
     """
     if not topic and not extra_urls:
         return ([], ["입력된 검색어/URL 없음"], []) if return_sources else []
 
+    # ---- 경로 1: Brave API ----
+    if topic and topic.strip() and brave_api_key:
+        sents, sources, links = brave_collect(
+            topic.strip(), brave_api_key, max_pages=max_pages,
+            fetch_bodies=brave_fetch_bodies, max_sentences=max_sentences,
+            country=country, search_lang=search_lang, freshness=freshness, delay=delay)
+        # 사용자가 직접 URL도 넣었으면 추가 크롤링
+        if extra_urls:
+            extra = [u.strip() for u in extra_urls
+                     if u.strip().startswith(("http://", "https://"))]
+            if extra:
+                es, esrc = crawl_urls(extra, max_sentences=max_sentences, delay=delay)
+                sents = sents + es
+                sources = sources + esrc
+                links = links + extra
+        if return_sources:
+            return sents, sources, links
+        return sents
+
+    # ---- 경로 2: 스크래핑 폴백 ----
     urls = []
     search_log = []
     if topic and topic.strip():
@@ -581,8 +693,8 @@ def crawl_topic(topic: str, max_pages=5, max_sentences=300, extra_urls=None, del
 
     if not urls:
         diag = ["검색 결과 0건 — 엔진별 시도:"] + search_log
-        diag.append("→ 모든 검색 엔진이 차단되었거나 네트워크가 막혀 있습니다. "
-                    "URL 직접 입력을 사용해 보세요.")
+        diag.append("→ 무료 검색엔진이 모두 차단되었습니다. "
+                    "Brave API 키를 넣거나 URL을 직접 입력하세요.")
         return ([], diag, []) if return_sources else []
 
     sentences, sources = crawl_urls(urls[:max_pages], max_sentences=max_sentences, delay=delay)
