@@ -29,28 +29,102 @@ import numpy as np
 # ======================================================================
 class EmbeddingProvider:
     """
-    tok_emb pkl 형식(권장): {"word2idx": {...}, "tok_emb": np.ndarray(V, dim)}
-    없으면 어절 해시 임베딩으로 폴백 (재현 가능, 네트워크 불필요).
+    실제 TinyTransformer tok_emb를 받아 사용. 없거나 형식 불명이면 해시 폴백.
+
+    인식하는 pkl 형식(자동 감지):
+      1) {"word2idx": {...}, "tok_emb": ndarray(V, dim)}            # 기본
+      2) {"word2idx": {...}, "tok_emb": ndarray, "dim": int}        # to_dict 직렬화형
+      3) {"word2idx": {...}, "embeddings"/"emb"/"weight": ndarray}  # 키 이름 변형
+      4) {"<단어>": ndarray, ...}                                    # 단어->벡터 딕셔너리
+      5) gascore_engine 통째 dict 안에 위 키들이 중첩된 경우도 탐색
+    self.load_error 에 실패 사유를 남겨 UI에서 표시할 수 있다.
     """
+    EMB_KEYS = ("tok_emb", "embeddings", "embedding", "emb", "weight", "weights", "vectors")
+
     def __init__(self, dim=64, tok_emb_path: str | None = None):
         self.dim = dim
         self.mode = "hash"
         self.word2idx = None
         self.tok_emb = None
+        self.load_error: str | None = None
+        self.vocab_size = 0
         self._cache: dict[str, np.ndarray] = {}
         if tok_emb_path and os.path.exists(tok_emb_path):
-            with open(tok_emb_path, "rb") as f:
-                d = pickle.load(f)
-            if "tok_emb" in d and "word2idx" in d:
-                self.tok_emb = np.asarray(d["tok_emb"], dtype=np.float64)
-                self.word2idx = d["word2idx"]
-                self.dim = self.tok_emb.shape[1]
-                self.mode = "tok_emb"
+            try:
+                self._load_tok_emb(tok_emb_path)
+            except Exception as e:
+                self.load_error = f"{type(e).__name__}: {e}"
+
+    @staticmethod
+    def _find_emb_and_vocab(d: dict):
+        """dict(중첩 포함)에서 임베딩 행렬과 word2idx를 찾아낸다."""
+        # 1) 직접 키
+        emb = None
+        for k in EmbeddingProvider.EMB_KEYS:
+            if k in d and d[k] is not None:
+                emb = np.asarray(d[k])
+                if emb.ndim == 2:
+                    break
+                emb = None
+        w2i = d.get("word2idx") or d.get("vocab") or d.get("stoi")
+        if emb is not None and w2i is not None:
+            return emb, w2i
+        # 2) idx2word만 있으면 뒤집어서 word2idx 생성
+        if emb is not None and "idx2word" in d:
+            i2w = d["idx2word"]
+            if isinstance(i2w, dict):
+                w2i = {v: int(k) for k, v in i2w.items()}
+            else:  # list
+                w2i = {w: i for i, w in enumerate(i2w)}
+            return emb, w2i
+        # 3) 한 단계 중첩 탐색 (예: {"engine": {...}} / {"som": ..., "tok": {...}})
+        for v in d.values():
+            if isinstance(v, dict):
+                e, w = EmbeddingProvider._find_emb_and_vocab(v)
+                if e is not None and w is not None:
+                    return e, w
+        return None, None
+
+    def _load_tok_emb(self, path: str):
+        with open(path, "rb") as f:
+            d = pickle.load(f)
+
+        # 형식 4: 단어->벡터 딕셔너리
+        if isinstance(d, dict) and d and all(
+            isinstance(k, str) for k in list(d.keys())[:20]
+        ) and all(
+            isinstance(v, (list, np.ndarray)) for v in list(d.values())[:5]
+        ) and not any(k in d for k in ("word2idx", "tok_emb", "idx2word", "vocab")):
+            words = list(d.keys())
+            mat = np.asarray([np.asarray(d[w], dtype=np.float64) for w in words])
+            self.word2idx = {w: i for i, w in enumerate(words)}
+            self.tok_emb = mat
+            self.dim = mat.shape[1]
+            self.vocab_size = len(words)
+            self.mode = "tok_emb"
+            return
+
+        if not isinstance(d, dict):
+            self.load_error = "pkl 최상위가 dict가 아님 — 인식 불가"
+            return
+
+        emb, w2i = self._find_emb_and_vocab(d)
+        if emb is None or w2i is None:
+            self.load_error = ("tok_emb/word2idx를 찾지 못함. "
+                               f"최상위 키: {list(d.keys())[:8]}")
+            return
+
+        self.tok_emb = np.asarray(emb, dtype=np.float64)
+        # 정수 인덱스 보장
+        self.word2idx = {str(k): int(v) for k, v in w2i.items()}
+        self.dim = self.tok_emb.shape[1]
+        self.vocab_size = self.tok_emb.shape[0]
+        self.mode = "tok_emb"
 
     def _word_vec(self, w: str) -> np.ndarray:
         if self.mode == "tok_emb":
             idx = self.word2idx.get(w)
-            if idx is not None:
+            if idx is not None and 0 <= idx < self.tok_emb.shape[0]:
                 return self.tok_emb[idx]
             return np.zeros(self.dim)
         # 해시 폴백
@@ -416,17 +490,19 @@ def llm_answer(
     client = OpenAI(**kwargs)
 
     ctx = "\n".join(f"- {s}" for s in context_sentences[:15])
-    system = system_prompt or (
-        "너는 학습된 코퍼스 범위 안에서만 답한다. "
-        "맥락에 없는 내용은 추측하지 말고 모른다고 말한다. "
-        "답변은 사용자가 이해하기 쉽게 하되, 학습된 맥락과 충돌하지 않게 작성한다."
-    )
     user = f"[학습된 맥락]\n{ctx}\n\n[질문]\n{question}"
+
+    # 시스템 프롬프트 미사용: 맥락만 user 메시지로 전달.
+    # system_prompt를 명시적으로 넘긴 경우에만 system 메시지를 추가한다.
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user})
 
     try:
         resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
