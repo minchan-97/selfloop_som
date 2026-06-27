@@ -66,8 +66,9 @@ def metric(col, label, value):
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.markdown("### ⚙ 설정")
-    up = st.file_uploader("tok_emb pkl (선택)", type=["pkl"], key="tokemb")
-    if up is not None:
+    up = st.file_uploader("tok_emb pkl (선택)", key="tokemb",
+                          help="TinyTransformer tok_emb가 담긴 .pkl")
+    if up is not None and up.name.lower().endswith(".pkl"):
         tmp = f"/tmp/{up.name}"
         with open(tmp, "wb") as f:
             f.write(up.getbuffer())
@@ -121,40 +122,45 @@ with st.sidebar:
     except Exception as e:
         st.markdown(f'<div class="warn">저장 준비 실패: {e}</div>',
                     unsafe_allow_html=True)
-    rl = st.file_uploader("pkl 불러오기(이전 학습 누적)", type=["pkl"], key="loadpkl")
+    rl = st.file_uploader("pkl 불러오기(이전 학습 누적)", key="loadpkl",
+                          help="저장한 selfloop_state.pkl 파일을 선택하세요.")
     if rl is not None:
-        # 같은 파일을 재실행마다 반복 로드하지 않도록 식별자 비교
-        sig = (rl.name, rl.size)
-        if st.session_state.get("_loaded_sig") != sig:
-            try:
-                with open("/tmp/_load.pkl", "wb") as f:
-                    f.write(rl.getbuffer())
-                loaded = SelfLoopState.load("/tmp/_load.pkl")
-                st.session_state.state = loaded
-                st.session_state._loaded_sig = sig
-                st.success(f"복원 완료: {len(loaded.corpus)}문장 · "
-                           f"{loaded.gsom.n}노드 · dim={loaded.dim} · "
-                           f"라운드 {loaded.gsom.round}")
-                # 임베딩 차원과 불일치 시 경고
-                if st.session_state.emb.dim != loaded.dim:
-                    st.markdown(
-                        f'<div class="warn">주의: 현재 임베딩 dim'
-                        f'({st.session_state.emb.dim}) ≠ 불러온 상태 dim'
-                        f'({loaded.dim}).<br>같은 임베딩으로 학습을 이어가려면 '
-                        f'저장 당시와 동일한 tok_emb(또는 해시)로 맞추세요.</div>',
+        st.caption(f"📄 파일 받음: {rl.name} ({rl.size:,} bytes)")
+        if not rl.name.lower().endswith(".pkl"):
+            st.markdown('<div class="warn">.pkl 파일만 불러올 수 있습니다. '
+                        '(선택한 파일: ' + rl.name + ')</div>',
                         unsafe_allow_html=True)
-            except Exception as e:
-                st.session_state._loaded_sig = None
-                st.markdown(f'<div class="warn">불러오기 실패: '
-                            f'{type(e).__name__}: {e}</div>',
-                            unsafe_allow_html=True)
         else:
-            st.caption(f"이미 불러옴: {rl.name} "
-                       f"({len(st.session_state.state.corpus)}문장)")
-        if st.button("불러온 상태 초기화(빈 코퍼스로)"):
-            st.session_state.state = SelfLoopState(dim=st.session_state.emb.dim)
-            st.session_state._loaded_sig = None
-            st.rerun()
+            sig = (rl.name, rl.size)
+            if st.session_state.get("_loaded_sig") != sig:
+                try:
+                    with open("/tmp/_load.pkl", "wb") as f:
+                        f.write(rl.getbuffer())
+                    loaded = SelfLoopState.load("/tmp/_load.pkl")
+                    st.session_state.state = loaded
+                    st.session_state._loaded_sig = sig
+                    st.success(f"복원 완료: {len(loaded.corpus)}문장 · "
+                               f"{loaded.gsom.n}노드 · dim={loaded.dim} · "
+                               f"라운드 {loaded.gsom.round}")
+                    if st.session_state.emb.dim != loaded.dim:
+                        st.markdown(
+                            f'<div class="warn">주의: 현재 임베딩 dim'
+                            f'({st.session_state.emb.dim}) ≠ 불러온 상태 dim'
+                            f'({loaded.dim}).<br>같은 임베딩으로 학습을 이어가려면 '
+                            f'저장 당시와 동일한 tok_emb(또는 해시)로 맞추세요.</div>',
+                            unsafe_allow_html=True)
+                except Exception as e:
+                    st.session_state._loaded_sig = None
+                    st.markdown(f'<div class="warn">불러오기 실패: '
+                                f'{type(e).__name__}: {e}</div>',
+                                unsafe_allow_html=True)
+            else:
+                st.caption(f"이미 불러옴: {rl.name} "
+                           f"({len(st.session_state.state.corpus)}문장)")
+            if st.button("불러온 상태 초기화(빈 코퍼스로)"):
+                st.session_state.state = SelfLoopState(dim=st.session_state.emb.dim)
+                st.session_state._loaded_sig = None
+                st.rerun()
 
 # ---------------------------------------------------------------- header
 st.markdown("# SelfLoop SOM")
@@ -181,8 +187,9 @@ with page[0]:
                            placeholder="오늘 날씨가 좋아요\n밥을 먹어요\n...")
         files = c2.file_uploader(
             "또는 파일 업로드 (txt · md · docx · pdf, 여러 개 가능)",
-            type=["txt", "md", "docx", "pdf"],
             accept_multiple_files=True,
+            key="corpusfiles",
+            help="지원: txt, md, docx, pdf (다른 형식은 무시됩니다)",
         )
         if txt.strip():
             new_sentences += [s.strip() for s in txt.splitlines() if s.strip()]
