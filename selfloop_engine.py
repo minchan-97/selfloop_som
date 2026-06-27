@@ -452,10 +452,43 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _is_garbage_sentence(s: str) -> bool:
+    """PDF 바이너리/깨진 인코딩 문장 판별."""
+    if not s:
+        return True
+    # PDF 내부 구조 흔적
+    if any(k in s for k in ("endobj", "endstream", "ProcSet", "/PDF",
+                            " obj ", "stream", "xref", "/Font", "/Type")):
+        return True
+    # 제어문자(널·비인쇄) 비율
+    ctrl = sum(1 for ch in s if ord(ch) < 32 and ch not in "\t\n\r")
+    if ctrl > 0:
+        return True
+    # '정상 문자' = 한글/기본영문/숫자/일반 문장부호/공백
+    normal = len(re.findall(r"[가-힣A-Za-z0-9 .,!?\"'()%~\-:;]", s))
+    if normal / len(s) < 0.75:
+        return True
+    # 한글 또는 (의미있는) 영문 단어가 최소한 있어야 함
+    has_ko = bool(re.search(r"[가-힣]{2,}", s))
+    has_en = bool(re.search(r"[A-Za-z]{3,}", s))
+    if not (has_ko or has_en):
+        return True
+    # 의미 단어(2글자+ 한글어절, 3글자+ 영단어) 개수가 너무 적으면 파편
+    ko_words = re.findall(r"[가-힣]{2,}", s)
+    en_words = re.findall(r"[A-Za-z]{3,}", s)
+    if len(ko_words) + len(en_words) < 2:
+        return True
+    # 짧은데 한글이 거의 없고 기호·대문자 뒤섞이면 PDF 파편
+    if len(s) < 40 and not has_ko:
+        upper = len(re.findall(r"[A-Z]", s))
+        if upper / max(1, len(s)) > 0.2:
+            return True
+    return False
+
+
 def _split_sentences(text: str, min_len=12, max_len=220):
     """한국어/영어가 섞인 웹문서를 학습용 문장으로 쪼갠다."""
     text = _clean_text(text)
-    # 문장부호 또는 줄바꿈성 구분자를 넓게 사용
     raw = re.split(r"(?<=[.!?。！？다요죠함음임됨됨니다])\s+|[\n\r]+|[•·]", text)
     out = []
     junk = ("cookie", "javascript", "copyright", "로그인", "회원가입", "개인정보", "구독", "광고")
@@ -465,9 +498,7 @@ def _split_sentences(text: str, min_len=12, max_len=220):
             continue
         if any(j.lower() in s.lower() for j in junk):
             continue
-        # 너무 URL/기호 위주인 문장 제거
-        alpha_ko = len(re.findall(r"[A-Za-z가-힣0-9]", s))
-        if alpha_ko / max(1, len(s)) < 0.45:
+        if _is_garbage_sentence(s):      # 깨진/PDF바이너리 문장 제거
             continue
         out.append(s)
     return out
@@ -575,13 +606,50 @@ _BROWSER_HEADERS = {
 }
 
 
-def _fetch_url_text(url: str, timeout=12) -> str:
+def _fetch_url_bytes(url: str, timeout=12):
+    """URL에서 raw bytes와 content-type을 가져온다."""
     import urllib.request
     req = urllib.request.Request(url, headers=_BROWSER_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
         ctype = r.headers.get("Content-Type", "")
-    # 간단 디코딩. 한국어 페이지는 utf-8/euc-kr 섞일 수 있음.
+    return raw, ctype
+
+
+def _pdf_bytes_to_text(raw: bytes) -> str:
+    """PDF 바이트에서 텍스트 추출 (pdfplumber 우선, pypdf 폴백)."""
+    import io as _io
+    text = ""
+    try:
+        import pdfplumber
+        with pdfplumber.open(_io.BytesIO(raw)) as pdf:
+            parts = []
+            for pg in pdf.pages:
+                t = pg.extract_text() or ""
+                if t.strip():
+                    parts.append(t)
+            text = "\n".join(parts)
+    except Exception:
+        text = ""
+    if not text.strip():
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(_io.BytesIO(raw))
+            text = "\n".join((pg.extract_text() or "") for pg in reader.pages)
+        except Exception:
+            text = ""
+    return text
+
+
+def _fetch_url_text(url: str, timeout=12) -> str:
+    raw, ctype = _fetch_url_bytes(url, timeout=timeout)
+    # PDF 감지: content-type 또는 URL 확장자 또는 매직넘버(%PDF)
+    is_pdf = ("application/pdf" in ctype.lower()
+              or url.lower().split("?")[0].endswith(".pdf")
+              or raw[:5] == b"%PDF-")
+    if is_pdf:
+        return _pdf_bytes_to_text(raw)
+    # HTML/텍스트 디코딩
     for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
         try:
             return raw.decode(enc, "ignore")
