@@ -27,6 +27,19 @@ import numpy as np
 # ======================================================================
 # 임베딩
 # ======================================================================
+def tokenize(sentence: str):
+    """한국어 어절 + 영문 단어 토크나이즈 (GrowingEmbedding/build_tok_emb 공용)."""
+    s = sentence.strip()
+    s = re.sub(r"https?://\S+|\S+@\S+", " ", s)
+    toks = re.findall(r"[가-힣]+|[A-Za-z]+|[0-9]+", s)
+    out = []
+    for t in toks:
+        if re.fullmatch(r"[A-Za-z0-9]", t):
+            continue
+        out.append(t.lower() if re.fullmatch(r"[A-Za-z]+", t) else t)
+    return out
+
+
 class EmbeddingProvider:
     """
     실제 TinyTransformer tok_emb를 받아 사용. 없거나 형식 불명이면 해시 폴백.
@@ -145,6 +158,149 @@ class EmbeddingProvider:
         X = np.stack([self.encode(s) for s in sentences])
         X = (X - X.mean(0)) / (X.std(0) + 1e-8)
         return X
+
+
+# ======================================================================
+# 점진적으로 자라는 임베딩 (씨앗 + 자율 성장)
+#   - 한국인이 모국어(씨앗)를 알고, 새 분야 전문어를 배우듯 동작
+#   - 새 단어: vocab에 추가, 주변 단어 평균으로 초기화(콜드스타트 완화)
+#   - 기존 단어: 새 문맥으로 skip-gram 미세조정
+#   - 씨앗 단어는 천천히(보호), 새 단어는 빠르게 학습 → 망각 방지
+# ======================================================================
+class GrowingEmbedding:
+    def __init__(self, dim=64, seed_lr=0.01, new_lr=0.05, window=3, neg=5, seed=0):
+        self.dim = dim
+        self.word2idx = {}
+        self.idx2word = {}
+        self.W = np.zeros((0, dim), dtype=np.float64)   # 중심 임베딩
+        self.C = np.zeros((0, dim), dtype=np.float64)   # 문맥 임베딩
+        self.freq = np.zeros(0, dtype=np.float64)
+        self.is_seed = np.zeros(0, dtype=bool)          # 씨앗 단어 보호 플래그
+        self.seed_lr = seed_lr                          # 씨앗 단어 학습률(작게)
+        self.new_lr = new_lr                            # 새 단어 학습률(크게)
+        self.window = window
+        self.neg = neg
+        self.rng = np.random.default_rng(seed)
+        self.total_updates = 0
+
+    # ---- 씨앗 적재: tok_emb pkl 또는 EmbeddingProvider에서 ----
+    def load_seed(self, tok_emb_path=None, word2idx=None, matrix=None):
+        if tok_emb_path:
+            prov = EmbeddingProvider(dim=self.dim, tok_emb_path=tok_emb_path)
+            if prov.mode != "tok_emb":
+                return False, (prov.load_error or "tok_emb 인식 실패")
+            word2idx, matrix = prov.word2idx, prov.tok_emb
+        if word2idx is None or matrix is None:
+            return False, "씨앗 데이터 없음"
+        matrix = np.asarray(matrix, dtype=np.float64)
+        self.dim = matrix.shape[1]
+        V = matrix.shape[0]
+        self.word2idx = dict(word2idx)
+        self.idx2word = {i: w for w, i in self.word2idx.items()}
+        self.W = matrix.copy()
+        self.C = matrix.copy() * 0.1
+        self.freq = np.ones(V)
+        self.is_seed = np.ones(V, dtype=bool)
+        return True, f"씨앗 {V}단어 적재(dim={self.dim})"
+
+    def _add_word(self, w, init_vec=None):
+        idx = len(self.word2idx)
+        self.word2idx[w] = idx
+        self.idx2word[idx] = w
+        if init_vec is None:
+            init_vec = (self.rng.random(self.dim) - 0.5) / self.dim
+        self.W = np.vstack([self.W, init_vec])
+        self.C = np.vstack([self.C, np.zeros(self.dim)])
+        self.freq = np.append(self.freq, 0.0)
+        self.is_seed = np.append(self.is_seed, False)
+        return idx
+
+    # ---- 새 문장들로 점진 학습 (vocab 성장 + 미세조정) ----
+    def grow(self, sentences, epochs=3):
+        # 1) 토크나이즈
+        seqs = [tokenize(s) for s in sentences]
+        # 2) 새 단어 등록 (주변 기존단어 평균으로 초기화 → 콜드스타트 완화)
+        new_words = 0
+        for toks in seqs:
+            for i, w in enumerate(toks):
+                if w not in self.word2idx:
+                    ctx = [self.W[self.word2idx[t]] for t in toks
+                           if t in self.word2idx]
+                    init = np.mean(ctx, axis=0) if ctx else None
+                    if init is not None:
+                        init = init + self.rng.normal(scale=0.01, size=self.dim)
+                    self._add_word(w, init)
+                    new_words += 1
+        # 3) 인덱스 시퀀스
+        idx_seqs = [[self.word2idx[w] for w in toks if w in self.word2idx]
+                    for toks in seqs]
+        idx_seqs = [s for s in idx_seqs if len(s) >= 2]
+        for s in idx_seqs:
+            for i in s:
+                self.freq[i] += 1
+        # 4) negative sampling 분포
+        p = self.freq ** 0.75
+        p = p / p.sum() if p.sum() > 0 else None
+
+        def sig(x):
+            return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+        for ep in range(epochs):
+            self.rng.shuffle(idx_seqs)
+            for s in idx_seqs:
+                for i, center in enumerate(s):
+                    win = self.rng.integers(1, self.window + 1)
+                    lo, hi = max(0, i - win), min(len(s), i + win + 1)
+                    for j in range(lo, hi):
+                        if j == i:
+                            continue
+                        ctx = s[j]
+                        negs = self.rng.choice(len(p), size=self.neg, p=p) if p is not None else []
+                        targets = np.array([ctx] + list(negs))
+                        labels = np.zeros(len(targets)); labels[0] = 1.0
+                        v_in = self.W[center]
+                        v_out = self.C[targets]
+                        g = sig(v_out @ v_in) - labels
+                        # 학습률: 중심단어가 씨앗이면 작게, 아니면 크게
+                        lr_c = self.seed_lr if self.is_seed[center] else self.new_lr
+                        grad_in = g @ v_out
+                        # 문맥 업데이트(타깃별 씨앗 여부 반영)
+                        lr_t = np.where(self.is_seed[targets], self.seed_lr, self.new_lr)
+                        self.C[targets] -= (lr_t[:, None]) * np.outer(g, v_in)
+                        self.W[center] -= lr_c * grad_in
+                        self.total_updates += 1
+        # 정규화는 encode 단계에서
+        return {"new_words": new_words, "vocab": len(self.word2idx)}
+
+    def _word_vec(self, w):
+        idx = self.word2idx.get(w)
+        if idx is not None:
+            return self.W[idx]
+        return np.zeros(self.dim)
+
+    def encode(self, sentence):
+        toks = tokenize(sentence)
+        if not toks:
+            return np.zeros(self.dim)
+        vs = [self._word_vec(w) for w in toks]
+        v = np.mean(vs, axis=0)
+        return v
+
+    def encode_many(self, sentences):
+        X = np.stack([self.encode(s) for s in sentences])
+        # 단위벡터 정규화 (SOM 붕괴 방지)
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+        return X
+
+    def save(self, path):
+        import pickle as _pk
+        _pk.dump({"word2idx": self.word2idx, "idx2word": self.idx2word,
+                  "tok_emb": self.W.astype(np.float32), "dim": self.dim,
+                  "is_seed": self.is_seed, "freq": self.freq}, open(path, "wb"))
+
+    @property
+    def vocab_size(self):
+        return len(self.word2idx)
 
 
 # ======================================================================
