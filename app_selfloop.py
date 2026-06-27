@@ -108,20 +108,53 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 💾 세션")
-    if st.button("현재 상태 pkl 저장"):
-        buf = io.BytesIO()
+    try:
         stt.save("/tmp/_save.pkl")
         with open("/tmp/_save.pkl", "rb") as f:
-            st.download_button("⬇ selfloop_state.pkl 내려받기", f.read(),
-                               file_name="selfloop_state.pkl")
+            st.download_button(
+                "⬇ 현재 상태 저장 (selfloop_state.pkl)",
+                f.read(),
+                file_name="selfloop_state.pkl",
+                help=f"코퍼스 {len(stt.corpus)}문장 · {stt.gsom.n}노드 · "
+                     f"라운드 {stt.gsom.round}",
+            )
+    except Exception as e:
+        st.markdown(f'<div class="warn">저장 준비 실패: {e}</div>',
+                    unsafe_allow_html=True)
     rl = st.file_uploader("pkl 불러오기(이전 학습 누적)", type=["pkl"], key="loadpkl")
-    if rl is not None and st.button("불러와서 이어가기"):
-        with open("/tmp/_load.pkl", "wb") as f:
-            f.write(rl.getbuffer())
-        st.session_state.state = SelfLoopState.load("/tmp/_load.pkl")
-        st.success(f"복원: {len(st.session_state.state.corpus)}문장 / "
-                   f"{st.session_state.state.gsom.n}노드")
-        st.rerun()
+    if rl is not None:
+        # 같은 파일을 재실행마다 반복 로드하지 않도록 식별자 비교
+        sig = (rl.name, rl.size)
+        if st.session_state.get("_loaded_sig") != sig:
+            try:
+                with open("/tmp/_load.pkl", "wb") as f:
+                    f.write(rl.getbuffer())
+                loaded = SelfLoopState.load("/tmp/_load.pkl")
+                st.session_state.state = loaded
+                st.session_state._loaded_sig = sig
+                st.success(f"복원 완료: {len(loaded.corpus)}문장 · "
+                           f"{loaded.gsom.n}노드 · dim={loaded.dim} · "
+                           f"라운드 {loaded.gsom.round}")
+                # 임베딩 차원과 불일치 시 경고
+                if st.session_state.emb.dim != loaded.dim:
+                    st.markdown(
+                        f'<div class="warn">주의: 현재 임베딩 dim'
+                        f'({st.session_state.emb.dim}) ≠ 불러온 상태 dim'
+                        f'({loaded.dim}).<br>같은 임베딩으로 학습을 이어가려면 '
+                        f'저장 당시와 동일한 tok_emb(또는 해시)로 맞추세요.</div>',
+                        unsafe_allow_html=True)
+            except Exception as e:
+                st.session_state._loaded_sig = None
+                st.markdown(f'<div class="warn">불러오기 실패: '
+                            f'{type(e).__name__}: {e}</div>',
+                            unsafe_allow_html=True)
+        else:
+            st.caption(f"이미 불러옴: {rl.name} "
+                       f"({len(st.session_state.state.corpus)}문장)")
+        if st.button("불러온 상태 초기화(빈 코퍼스로)"):
+            st.session_state.state = SelfLoopState(dim=st.session_state.emb.dim)
+            st.session_state._loaded_sig = None
+            st.rerun()
 
 # ---------------------------------------------------------------- header
 st.markdown("# SelfLoop SOM")
